@@ -53,7 +53,7 @@ systemctl --user daemon-reload
 systemctl --user enable --now haylou-s40
 ```
 
-While the daemon runs it owns the socket, so `--gui` exits with a notice: stop it first with `systemctl --user stop haylou-s40`. Without the daemon everything still works; each CLI call connects to the headset, reads, and disconnects.
+While the daemon runs it owns the socket and the RFCOMM link: the GUI and the CLI become clients of it (the window never opens a second Bluetooth connection). Without the daemon everything still works; each CLI call connects to the headset, reads, and disconnects.
 
 
 ---

@@ -1053,14 +1053,9 @@ def serve_forever() -> int:
 # ───────────────────────── Interfaz Gráfica (GTK4 + Libadwaita) ─────────────────────────
 
 def launch_gui() -> int:
-    if try_ipc_request({"action": "status"}) is not None:
-        message = "El daemon está activo. Deténlo antes de abrir la GUI: systemctl --user stop haylou-s40"
-        print(f"haylou-s40: {message}", file=sys.stderr)
-        try:
-            subprocess.run(["notify-send", "Haylou S40", message], timeout=2.0)
-        except Exception:
-            pass
-        return 2
+    # Si hay un daemon (o GUI) activo, esta instancia actúa como cliente por IPC:
+    # no abre RFCOMM y no toca el socket, así ambos conviven sin colisiones.
+    remote = try_ipc_request({"action": "status"}) is not None
 
     import gi
     gi.require_version("Gtk", "4.0")
@@ -1068,8 +1063,9 @@ def launch_gui() -> int:
     from gi.repository import Adw, Gio, GLib, Gtk
 
     class HaylouWindow(Adw.ApplicationWindow):
-        def __init__(self, **kwargs) -> None:
+        def __init__(self, remote: bool = False, **kwargs) -> None:
             super().__init__(**kwargs)
+            self.remote = remote
             self.state: dict[str, Any] = load_cache()
             self.rfcomm: HaylouRfcomm | None = None
             self._rf_lock = threading.Lock()
@@ -1084,9 +1080,10 @@ def launch_gui() -> int:
             self._build_ui()
             self.connect("close-request", self._on_close_request)
 
-            # Iniciar trabajador RFCOMM + servidor UNIX
+            # En modo remoto el daemon es dueño del socket y del RFCOMM.
+            if not self.remote:
+                threading.Thread(target=self._ipc_worker, daemon=True).start()
             threading.Thread(target=self._rfcomm_worker, daemon=True).start()
-            threading.Thread(target=self._ipc_worker, daemon=True).start()
 
         def _build_ui(self) -> None:
             self.toast_overlay = Adw.ToastOverlay()
@@ -1459,6 +1456,14 @@ def launch_gui() -> int:
             return False
 
         def _run_locked_action(self, action: str, value: Any) -> tuple[bool, str, dict[str, Any]]:
+            if self.remote:
+                resp = try_ipc_request({"action": action, "value": value})
+                if resp is None:
+                    return (False, "El daemon no responde", dict(self.state))
+                new_st = resp.get("state") or dict(self.state)
+                with self._rf_lock:
+                    self.state = new_st
+                return (bool(resp.get("ok", True)), resp.get("message", ""), dict(new_st))
             with self._rf_lock:
                 if self.rfcomm is None and detect_usb_connected():
                     self.state = build_usb_state(self.state)
@@ -1473,7 +1478,29 @@ def launch_gui() -> int:
 
         # ── Hilos de RFCOMM y servidor UNIX IPC ──
 
+        def _remote_worker(self) -> None:
+            """Modo cliente: refleja el estado del daemon sin abrir RFCOMM."""
+            misses = 0
+            while not self._stop_event.is_set():
+                resp = try_ipc_request({"action": "status"})
+                state = resp.get("state") if isinstance(resp, dict) else None
+                if isinstance(state, dict):
+                    misses = 0
+                    with self._rf_lock:
+                        self.state = state
+                    GLib.idle_add(self._sync_ui_from_state, dict(state))
+                else:
+                    misses += 1
+                    if misses == 3:
+                        with self._rf_lock:
+                            self.state = {**self.state, "connected": False, "transport": "none"}
+                        GLib.idle_add(self._sync_ui_from_state, dict(self.state))
+                time.sleep(2.0)
+
         def _rfcomm_worker(self) -> None:
+            if self.remote:
+                self._remote_worker()
+                return
             last_poll = 0.0
             while not self._stop_event.is_set():
                 if self.rfcomm is None:
@@ -1619,7 +1646,7 @@ def launch_gui() -> int:
         def do_activate(self) -> None:
             Adw.StyleManager.get_default().set_color_scheme(Adw.ColorScheme.PREFER_DARK)
             if self.win is None:
-                self.win = HaylouWindow(application=self)
+                self.win = HaylouWindow(remote=remote, application=self)
             self.win.present()
 
     app = HaylouApp()
