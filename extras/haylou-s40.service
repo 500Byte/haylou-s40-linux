@@ -1,13 +1,15 @@
 [Unit]
 Description=Haylou S40 headset daemon (RFCOMM + UNIX socket)
 Documentation=https://github.com/500Byte/haylou-s40-linux
-After=bluetooth.service
-Wants=bluetooth.service
+# Sin dependencias: el daemon reintenta la conexión por sí mismo, así que no
+# necesita que BlueZ esté listo (y los user units no se ordenan con los del sistema).
 
 [Service]
 Type=simple
 ExecStart=%h/.local/bin/haylou-s40 --serve
-Restart=on-failure
+# on-abnormal: un crash (señal) se reinicia, pero un "ya hay otra instancia"
+# (exit 1) no entra en bucle de reinicios.
+Restart=on-abnormal
 RestartSec=3
 Environment=PYTHONUNBUFFERED=1
 # El socket IPC y la cache viven en $XDG_RUNTIME_DIR, que systemd --user define.
