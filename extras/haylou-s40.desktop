@@ -1,0 +1,11 @@
+[Desktop Entry]
+Version=1.0
+Type=Application
+Name=Haylou S40
+Comment=Controlador de auriculares Haylou S40 (ANC, EQ, Modo Juego, Códec)
+Exec=haylou-s40 --gui
+Icon=audio-headphones
+Terminal=false
+Categories=AudioVideo;Settings;Utility;
+StartupWMClass=com.diego.HaylouS40
+Keywords=haylou;s40;bluetooth;anc;headphones;audifonos;

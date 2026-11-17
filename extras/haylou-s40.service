@@ -1,0 +1,17 @@
+[Unit]
+Description=Haylou S40 headset daemon (RFCOMM + UNIX socket)
+Documentation=https://github.com/500Byte/haylou-s40-linux
+After=bluetooth.service
+Wants=bluetooth.service
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/haylou-s40 --serve
+Restart=on-failure
+RestartSec=3
+Environment=PYTHONUNBUFFERED=1
+# El socket IPC y la cache viven en $XDG_RUNTIME_DIR, que systemd --user define.
+SyslogIdentifier=haylou-s40
+
+[Install]
+WantedBy=default.target
