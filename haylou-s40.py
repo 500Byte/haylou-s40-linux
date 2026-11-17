@@ -26,6 +26,11 @@ from typing import Any
 
 DEFAULT_ADDR = os.environ.get("HAYLOU_S40_ADDR", "").strip().upper()
 RFCOMM_CHANNEL = 10
+MAC_RE = re.compile(r"^[0-9A-Fa-f]{2}(?::[0-9A-Fa-f]{2}){5}$")
+
+# Identidad del DAC USB Jieli: única fuente para detectarlo y para localizar su sink.
+USB_ID = "3654:4a55"
+USB_SINK_HINT = "Jieli"
 
 RUNTIME_DIR = Path(os.environ.get("XDG_RUNTIME_DIR") or f"/run/user/{os.getuid()}")
 SOCKET_PATH = RUNTIME_DIR / "haylou-s40.sock"
@@ -286,10 +291,10 @@ def detect_usb_connected() -> bool:
     """Comprueba si los Haylou S40 están conectados como DAC USB (Jieli 3654:4a55)."""
     try:
         for p in Path("/proc/asound").glob("card*/usbid"):
-            if p.read_text(encoding="utf-8", errors="ignore").strip().lower() == "3654:4a55":
+            if p.read_text(encoding="utf-8", errors="ignore").strip().lower() == USB_ID:
                 return True
         cards = Path("/proc/asound/cards")
-        if cards.exists() and "Jieli Technology USB Composite Device" in cards.read_text(encoding="utf-8", errors="ignore"):
+        if cards.exists() and USB_SINK_HINT in cards.read_text(encoding="utf-8", errors="ignore"):
             return True
     except Exception:
         pass
@@ -297,12 +302,12 @@ def detect_usb_connected() -> bool:
 
 
 def build_usb_state(prev_state: dict[str, Any] | None = None) -> dict[str, Any]:
-    st = dict(prev_state) if prev_state else default_state("USB (3654:4a55)")
-    rate = get_pipewire_sample_rate(usb_sink_hint()) or 48000
+    st = dict(prev_state) if prev_state else default_state(f"USB ({USB_ID})")
+    rate = get_pipewire_sample_rate(USB_SINK_HINT) or 48000
     st.update({
         "connected": True,
         "transport": "usb",
-        "address": "USB (3654:4a55)",
+        "address": f"USB ({USB_ID})",
         "battery": 0,
         "anc_mode": 0,
         "anc_key": "usb",
@@ -317,18 +322,22 @@ def build_usb_state(prev_state: dict[str, Any] | None = None) -> dict[str, Any]:
     return st
 
 
-def detect_haylou_address() -> str | None:
-    """Busca si hay un HAYLOU S40 conectado en BlueZ; fallback opcional a HAYLOU_S40_ADDR."""
+def detect_haylou_address(cached_addr: str | None = None) -> str | None:
+    """Devuelve el MAC cacheado si es válido; si no, descubre en BlueZ.
+
+    La cache evita lanzar `bluetoothctl` en cada invocación del CLI.
+    """
+    if cached_addr and MAC_RE.match(cached_addr):
+        return cached_addr.upper()
     try:
         res = subprocess.run(
             ["bluetoothctl", "devices", "Connected"],
             capture_output=True, text=True, timeout=2.0,
         )
         for line in res.stdout.splitlines():
-            if "HAYLOU S40" in line.upper():
-                parts = line.split()
-                if len(parts) >= 2 and re.match(r"^[0-9A-Fa-f:]{17}$", parts[1]):
-                    return parts[1].upper()
+            parts = line.split()
+            if "HAYLOU S40" in line.upper() and len(parts) >= 2 and MAC_RE.match(parts[1]):
+                return parts[1].upper()
         if DEFAULT_ADDR:
             info = subprocess.run(
                 ["bluetoothctl", "info", DEFAULT_ADDR],
@@ -373,17 +382,12 @@ def get_pipewire_audio_info(addr: str, pactl_data: dict[str, Any] | None = None)
     if card is None:
         return ("", "Desconectado", [])
     profiles = card.get("profiles") or {}
-    avail = [pid for pid, prof in profiles.items() if prof.get("available")]
+    avail = [
+        pid for pid, prof in profiles.items()
+        if prof.get("available") and pid.startswith(("a2dp-sink", "headset-head-unit"))
+    ]
     active_profile = card.get("active_profile") or ""
     return (active_profile, CODEC_LABELS.get(active_profile, active_profile or "N/A"), avail)
-
-
-def usb_sink_hint() -> str:
-    return "Jieli"
-
-
-def bluetooth_sink_hint(addr: str) -> str:
-    return f"bluez_output.{addr.upper().replace(':', '_')}" if addr else ""
 
 
 def get_pipewire_sample_rate(node_hint: str, pactl_data: dict[str, Any] | None = None) -> int | None:
@@ -466,11 +470,14 @@ def enrich_state(state: dict[str, Any], pactl_data: dict[str, Any] | None = None
 
     addr = state.get("address") or DEFAULT_ADDR
     data = pactl_data if pactl_data is not None else read_pactl_json()
-    prof, codec, avail = get_pipewire_audio_info(addr, data)
-    state["active_profile"] = prof
-    state["codec"] = codec
-    state["available_profiles"] = avail
-    state["sample_rate"] = get_pipewire_sample_rate(bluetooth_sink_hint(addr), data) or 0
+    # Una lectura fallida de pactl no es "sin tarjeta": conservar lo último conocido.
+    if data:
+        prof, codec, avail = get_pipewire_audio_info(addr, data)
+        state["active_profile"] = prof
+        state["codec"] = codec
+        state["available_profiles"] = avail
+        sink_hint = f"bluez_output.{addr.upper().replace(':', '_')}"
+        state["sample_rate"] = get_pipewire_sample_rate(sink_hint, data) or 0
     state["updated_at"] = time.time()
     return state
 
@@ -834,8 +841,8 @@ def run_cli_oneshot(action: str, value: Any = None) -> tuple[bool, str, dict[str
         return (bool(ipc_resp.get("ok", True)), ipc_resp.get("message", ""), ipc_resp.get("state", {}))
 
     # 2. Detectar si el auricular está conectado en BlueZ o por USB
-    addr = detect_haylou_address()
     cached = load_cache()
+    addr = detect_haylou_address(cached.get("address"))
     if not addr:
         if detect_usb_connected():
             st = build_usb_state(cached)
@@ -880,7 +887,15 @@ def run_cli_oneshot(action: str, value: Any = None) -> tuple[bool, str, dict[str
             save_cache(st)
             return (ok, msg, st)
         except Exception as exc:
-            st = enrich_state(dict(cached, connected=True, transport="bluetooth", address=addr, error=str(exc)))
+            st = dict(cached, address=addr, error=str(exc))
+            if detect_usb_connected():
+                st = build_usb_state(st)
+                save_cache(st)
+                if action == "status":
+                    return (True, "Conectado por DAC USB", st)
+                return (False, "En modo USB el control RFCOMM Bluetooth está inactivo", st)
+            st = enrich_state({**st, "connected": False, "transport": "none"})
+            save_cache(st)
             return (False, str(exc), st)
         finally:
             rfcomm.close()
@@ -892,7 +907,7 @@ def print_human_status(st: dict[str, Any]) -> None:
         print("Haylou S40: desconectado")
         return
     if st.get("transport") == "usb":
-        print("Dispositivo      : HAYLOU S40 (USB 3654:4a55)")
+        print(f"Dispositivo      : HAYLOU S40 (USB {USB_ID})")
         print("Modo             : DAC USB Directo (Cargando)")
         print(f"Audio PipeWire   : {st.get('codec', 'PCM')} Full-Duplex (Salida Estéreo + Micrófono)")
         return
@@ -923,7 +938,12 @@ class HaylouDaemon:
         self.rfcomm: HaylouRfcomm | None = None
 
     def serve(self) -> int:
-        if try_ipc_request({"action": "status"}) is not None:
+        # El socket puede estar ocupado por una GUI que se está cerrando: reintentar.
+        for _ in range(5):
+            if try_ipc_request({"action": "status"}) is None:
+                break
+            time.sleep(0.6)
+        else:
             print("haylou-s40: ya hay una instancia activa", file=sys.stderr)
             return 1
         ipc = threading.Thread(target=self._ipc_worker, daemon=True)
@@ -945,7 +965,7 @@ class HaylouDaemon:
         last_poll = 0.0
         while not self.stop_event.is_set():
             if self.rfcomm is None:
-                addr = detect_haylou_address()
+                addr = detect_haylou_address(self.state.get("address"))
                 if addr:
                     rf = HaylouRfcomm(addr)
                     try:
@@ -957,7 +977,7 @@ class HaylouDaemon:
                         last_poll = time.monotonic()
                     except Exception:
                         rf.close()
-                else:
+                if self.rfcomm is None:
                     with self.lock:
                         if detect_usb_connected():
                             self.state = build_usb_state(self.state)
@@ -1500,7 +1520,7 @@ def launch_gui() -> int:
             last_poll = 0.0
             while not self._stop_event.is_set():
                 if self.rfcomm is None:
-                    addr = detect_haylou_address()
+                    addr = detect_haylou_address(self.state.get("address"))
                     if addr:
                         snap = None
                         with self._rf_lock:
