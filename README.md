@@ -78,6 +78,16 @@ haylou-s40 ldac <on|off>
 haylou-s40 preset <focus|music|gaming|street>
 ```
 
+`--json` returns the whole state, including `transport` (`bluetooth`/`usb`), `sample_rate`, `available_profiles` and the `ok`/`message` pair, so a bar can build codec lists from real data.
+
+---
+
+## Development
+
+```bash
+python3 test_protocol.py   # frames, TLV decoders, state mapping and PipeWire JSON
+```
+
 ---
 
 ## Credits

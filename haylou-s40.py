@@ -311,8 +311,6 @@ def build_usb_state(prev_state: dict[str, Any] | None = None) -> dict[str, Any]:
         "anc_icon": "headphones",
         "codec": f"PCM {rate // 1000} kHz",
         "sample_rate": rate,
-        "active_profile": "output:analog-stereo+input:mono-fallback",
-        "available_profiles": ["output:analog-stereo+input:mono-fallback", "output:analog-stereo"],
         "updated_at": time.time(),
         "error": None,
     })
@@ -343,73 +341,41 @@ def detect_haylou_address() -> str | None:
     return None
 
 
-def get_pipewire_audio_info(addr: str) -> tuple[str, str, list[str]]:
-    """Devuelve (active_profile, active_codec_label, available_profiles)."""
-    card_name = f"bluez_card.{addr.upper().replace(':', '_')}"
+CODEC_LABELS = {
+    "a2dp-sink": "AAC",
+    "a2dp-sink-sbc_xq": "SBC-XQ",
+    "a2dp-sink-sbc": "SBC",
+    "a2dp-sink-ldac": "LDAC",
+    "headset-head-unit": "HFP (mSBC)",
+    "headset-head-unit-cvsd": "HFP (CVSD)",
+}
+
+
+def read_pactl_json() -> dict[str, Any]:
+    """Una sola lectura estructurada de PipeWire (evita parsear texto localizado)."""
     try:
-        res = subprocess.run(["pactl", "list", "cards"], capture_output=True, text=True, timeout=2.0)
-        blocks = res.stdout.split("Tarjeta #")
-        if len(blocks) == 1:
-            blocks = res.stdout.split("Card #")
-        target = next((b for b in blocks if card_name in b), "")
-        if not target:
-            return ("", "Desconectado", [])
-
-        avail: list[str] = []
-        in_profiles = False
-        active_profile = ""
-        for line in target.splitlines():
-            stripped = line.strip()
-            if stripped.startswith("Profiles:") or stripped.startswith("Perfiles:"):
-                in_profiles = True
-                continue
-            if stripped.startswith("Active Profile:") or stripped.startswith("Perfil activo:"):
-                in_profiles = False
-                active_profile = stripped.split(":", 1)[1].strip()
-                continue
-            if stripped.startswith("Ports:") or stripped.startswith("Puertos:"):
-                in_profiles = False
-                continue
-            if in_profiles and ":" in stripped and "available: yes" in stripped:
-                prof_id = stripped.split(":", 1)[0].strip()
-                avail.append(prof_id)
-
-        codec_label = {
-            "a2dp-sink": "AAC",
-            "a2dp-sink-sbc_xq": "SBC-XQ",
-            "a2dp-sink-sbc": "SBC",
-            "a2dp-sink-ldac": "LDAC",
-            "headset-head-unit": "HFP (mSBC)",
-            "headset-head-unit-cvsd": "HFP (CVSD)",
-        }.get(active_profile, active_profile or "N/A")
-        return (active_profile, codec_label, avail)
-    except Exception:
-        return ("", "N/A", [])
-
-
-def parse_sample_rate(pactl_sinks_text: str, node_hint: str) -> int | None:
-    """Extrae la frecuencia de muestreo del sink cuyo bloque contiene `node_hint`."""
-    if not node_hint:
-        return None
-    blocks = re.split(r"(?:Sink|Sumidero)\s*#\d+", pactl_sinks_text)
-    for block in blocks:
-        if node_hint not in block:
-            continue
-        m = re.search(r"\d+\s*ch\s+(\d+)\s*Hz", block)
-        if m:
-            return int(m.group(1))
-    return None
-
-
-def get_pipewire_sample_rate(node_hint: str) -> int | None:
-    """Lee la frecuencia real del sink activo en PipeWire (independiente del idioma)."""
-    try:
-        res = subprocess.run(["pactl", "list", "sinks"], capture_output=True, text=True, timeout=2.0)
+        res = subprocess.run(
+            ["pactl", "-f", "json", "list"], capture_output=True, text=True, timeout=2.0
+        )
         if res.returncode != 0:
-            return None
-        return parse_sample_rate(res.stdout, node_hint)
+            return {}
+        data = json.loads(res.stdout)
+        return data if isinstance(data, dict) else {}
     except Exception:
-        return None
+        return {}
+
+
+def get_pipewire_audio_info(addr: str, pactl_data: dict[str, Any] | None = None) -> tuple[str, str, list[str]]:
+    """Devuelve (active_profile, active_codec_label, available_profiles)."""
+    data = pactl_data if pactl_data is not None else read_pactl_json()
+    card_name = f"bluez_card.{addr.upper().replace(':', '_')}"
+    card = next((c for c in data.get("cards", []) if c.get("name") == card_name), None)
+    if card is None:
+        return ("", "Desconectado", [])
+    profiles = card.get("profiles") or {}
+    avail = [pid for pid, prof in profiles.items() if prof.get("available")]
+    active_profile = card.get("active_profile") or ""
+    return (active_profile, CODEC_LABELS.get(active_profile, active_profile or "N/A"), avail)
 
 
 def usb_sink_hint() -> str:
@@ -418,6 +384,21 @@ def usb_sink_hint() -> str:
 
 def bluetooth_sink_hint(addr: str) -> str:
     return f"bluez_output.{addr.upper().replace(':', '_')}" if addr else ""
+
+
+def get_pipewire_sample_rate(node_hint: str, pactl_data: dict[str, Any] | None = None) -> int | None:
+    """Frecuencia del sink cuyo nombre contiene `node_hint`, desde la salida JSON."""
+    if not node_hint:
+        return None
+    data = pactl_data if pactl_data is not None else read_pactl_json()
+    for sink in data.get("sinks", []):
+        if node_hint not in (sink.get("name") or ""):
+            continue
+        spec = sink.get("sample_specification") or ""
+        m = re.search(r"(\d+)\s*Hz", spec)
+        if m:
+            return int(m.group(1))
+    return None
 
 
 def set_pipewire_profile(addr: str, profile: str) -> tuple[bool, str]:
@@ -464,7 +445,7 @@ def default_state(addr: str | None = None) -> dict[str, Any]:
     }
 
 
-def enrich_state(state: dict[str, Any]) -> dict[str, Any]:
+def enrich_state(state: dict[str, Any], pactl_data: dict[str, Any] | None = None) -> dict[str, Any]:
     if state.get("transport") == "usb":
         return build_usb_state(state)
 
@@ -484,11 +465,12 @@ def enrich_state(state: dict[str, Any]) -> dict[str, Any]:
     state["spatial_key"] = SPATIAL_BY_VAL.get(sp, ("off", "Desactivado"))[0]
 
     addr = state.get("address") or DEFAULT_ADDR
-    prof, codec, avail = get_pipewire_audio_info(addr)
+    data = pactl_data if pactl_data is not None else read_pactl_json()
+    prof, codec, avail = get_pipewire_audio_info(addr, data)
     state["active_profile"] = prof
     state["codec"] = codec
     state["available_profiles"] = avail
-    state["sample_rate"] = get_pipewire_sample_rate(bluetooth_sink_hint(addr)) or 0
+    state["sample_rate"] = get_pipewire_sample_rate(bluetooth_sink_hint(addr), data) or 0
     state["updated_at"] = time.time()
     return state
 
@@ -785,7 +767,7 @@ def try_ipc_request(payload: dict[str, Any]) -> dict[str, Any] | None:
         return None
     try:
         with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as cli:
-            cli.settimeout(4.0)
+            cli.settimeout(8.0)
             cli.connect(str(SOCKET_PATH))
             cli.sendall((json.dumps(payload) + "\n").encode("utf-8"))
             chunks: list[bytes] = []
@@ -798,15 +780,51 @@ def try_ipc_request(payload: dict[str, Any]) -> dict[str, Any] | None:
                     break
             raw = b"".join(chunks).decode("utf-8").strip()
             return json.loads(raw) if raw else None
-    except (ConnectionRefusedError, FileNotFoundError):
-        # Socket huérfano de una instancia que murió sin limpiar
-        try:
-            SOCKET_PATH.unlink()
-        except Exception:
-            pass
-        return None
     except Exception:
         return None
+
+
+def handle_ipc_connection(conn: socket.socket, owner: Any, run_action: Any = None, on_state: Any = None) -> None:
+    """Atiende una petición IPC. `owner` expone .lock, .state y .rfcomm.
+
+    Con `run_action` el dueño ejecuta la acción (y guarda su cache); sin él se
+    usa el ejecutor directo. Compartido por el daemon y la GUI para que ambos
+    respondan igual.
+    """
+    with conn:
+        try:
+            raw = conn.recv(4096).decode("utf-8").strip()
+            req = json.loads(raw) if raw else {"action": "status"}
+            action = req.get("action", "status")
+            value = req.get("value")
+            with owner.lock:
+                if action == "status":
+                    owner.state = enrich_state(dict(owner.state))
+                    connected = bool(owner.state.get("connected"))
+                    resp = {
+                        "ok": connected,
+                        "message": "Estado vivo" if connected else "Auricular desconectado",
+                        "state": owner.state,
+                    }
+                elif run_action is not None:
+                    ok, msg, new_st = run_action(action, value)
+                    owner.state = new_st
+                    resp = {"ok": ok, "message": msg, "state": new_st}
+                else:
+                    ok, msg, new_st = execute_action_on_rfcomm(
+                        owner.rfcomm, dict(owner.state), action, value
+                    )
+                    owner.state = new_st
+                    save_cache(owner.state)
+                    resp = {"ok": ok, "message": msg, "state": new_st}
+            if on_state is not None:
+                on_state(dict(owner.state))
+            conn.sendall((json.dumps(resp, ensure_ascii=False) + "\n").encode("utf-8"))
+        except Exception as exc:
+            try:
+                conn.sendall((json.dumps({"ok": False, "message": str(exc)}) + "\n").encode("utf-8"))
+            except Exception:
+                pass
 
 
 def run_cli_oneshot(action: str, value: Any = None) -> tuple[bool, str, dict[str, Any]]:
@@ -992,29 +1010,7 @@ class HaylouDaemon:
                 continue
             except OSError:
                 break
-            with conn:
-                try:
-                    raw = conn.recv(4096).decode("utf-8").strip()
-                    req = json.loads(raw) if raw else {"action": "status"}
-                    action = req.get("action", "status")
-                    value = req.get("value")
-                    with self.lock:
-                        if action == "status":
-                            self.state = enrich_state(dict(self.state))
-                            resp = {"ok": True, "message": "Estado vivo", "state": self.state}
-                        else:
-                            ok, msg, new_st = execute_action_on_rfcomm(
-                                self.rfcomm, dict(self.state), action, value
-                            )
-                            self.state = new_st
-                            save_cache(self.state)
-                            resp = {"ok": ok, "message": msg, "state": new_st}
-                    conn.sendall((json.dumps(resp, ensure_ascii=False) + "\n").encode("utf-8"))
-                except Exception as exc:
-                    try:
-                        conn.sendall((json.dumps({"ok": False, "message": str(exc)}) + "\n").encode("utf-8"))
-                    except Exception:
-                        pass
+            handle_ipc_connection(conn, self)
 
         try:
             srv.close()
@@ -1068,10 +1064,10 @@ def launch_gui() -> int:
             self.remote = remote
             self.state: dict[str, Any] = load_cache()
             self.rfcomm: HaylouRfcomm | None = None
-            self._rf_lock = threading.Lock()
+            self._rf_lock = threading.RLock()
+            self.lock = self._rf_lock  # alias usado por handle_ipc_connection
             self._stop_event = threading.Event()
             self._syncing_ui = False
-            self._ipc_server: socket.socket | None = None
 
             self.set_title("Haylou S40")
             self.set_default_size(540, 720)
@@ -1586,7 +1582,6 @@ def launch_gui() -> int:
                 srv.bind(str(SOCKET_PATH))
                 srv.listen(8)
                 srv.settimeout(0.5)
-                self._ipc_server = srv
             except Exception:
                 return
 
@@ -1598,27 +1593,12 @@ def launch_gui() -> int:
                 except OSError:
                     break
 
-                with conn:
-                    try:
-                        raw = conn.recv(4096).decode("utf-8").strip()
-                        req = json.loads(raw) if raw else {"action": "status"}
-                        action = req.get("action", "status")
-                        value = req.get("value")
-                        if action == "status" and self.state.get("connected"):
-                            # Respuesta instantánea usando estado vivo + refresco de códec
-                            with self._rf_lock:
-                                self.state = enrich_state(self.state)
-                                resp = {"ok": True, "message": "Estado vivo", "state": self.state}
-                        else:
-                            ok, msg, new_st = self._run_locked_action(action, value)
-                            GLib.idle_add(self._sync_ui_from_state, new_st)
-                            resp = {"ok": ok, "message": msg, "state": new_st}
-                        conn.sendall((json.dumps(resp, ensure_ascii=False) + "\n").encode("utf-8"))
-                    except Exception as exc:
-                        try:
-                            conn.sendall((json.dumps({"ok": False, "message": str(exc)}) + "\n").encode("utf-8"))
-                        except Exception:
-                            pass
+                handle_ipc_connection(
+                    conn,
+                    self,
+                    run_action=self._run_locked_action,
+                    on_state=lambda st: GLib.idle_add(self._sync_ui_from_state, st),
+                )
 
             try:
                 srv.close()
